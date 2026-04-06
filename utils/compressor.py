@@ -7,6 +7,10 @@ from typing import Optional, Callable, Awaitable
 
 log = logging.getLogger("vbot.compressor")
 
+FFPROBE_TIMEOUT = 30
+FFMPEG_LINE_TIMEOUT = 120
+FFMPEG_WAIT_TIMEOUT = 60
+
 
 async def get_video_duration(file_path: Path) -> float:
     try:
@@ -16,7 +20,13 @@ async def get_video_duration(file_path: Path) -> float:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            log.warning("ffprobe timed out for %s", file_path.name)
+            return 0
         data = json.loads(stdout.decode())
         return float(data.get("format", {}).get("duration", 0))
     except Exception as e:
@@ -32,7 +42,13 @@ async def get_video_info(file_path: Path) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            log.warning("ffprobe info timed out for %s", file_path.name)
+            return {"duration": 0, "width": 0, "height": 0, "codec": ""}
         data = json.loads(stdout.decode())
         info = {"duration": 0, "width": 0, "height": 0, "codec": ""}
         fmt = data.get("format", {})
@@ -61,7 +77,12 @@ async def extract_thumbnail(file_path: Path, output_path: Path, time_pos: float 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
         if not output_path.exists():
             return False
         if output_path.stat().st_size > 200 * 1024:
@@ -74,7 +95,11 @@ async def extract_thumbnail(file_path: Path, output_path: Path, time_pos: float 
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc2.communicate()
+            try:
+                await asyncio.wait_for(proc2.communicate(), timeout=FFPROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc2.kill()
+                await proc2.wait()
             if tmp_thumb.exists() and tmp_thumb.stat().st_size > 0:
                 tmp_thumb.replace(output_path)
         return output_path.exists() and output_path.stat().st_size > 0
@@ -132,7 +157,14 @@ async def compress_video(
                 await proc.wait()
                 return False
 
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=60)
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=FFMPEG_LINE_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.warning("FFmpeg output stalled (no line for %ds), killing process", FFMPEG_LINE_TIMEOUT)
+                proc.kill()
+                await proc.wait()
+                return False
+
             if not line:
                 break
 
@@ -142,16 +174,27 @@ async def compress_video(
                 current_us = int(match.group(1))
                 current_sec = current_us / 1_000_000
                 pct = min((current_sec / duration) * 100, 99.9)
-                await progress_callback(pct, duration)
+                try:
+                    await progress_callback(pct, duration)
+                except asyncio.CancelledError:
+                    proc.kill()
+                    await proc.wait()
+                    return False
+                except Exception as e:
+                    log.debug("compress progress_callback error: %s", e)
 
-    except asyncio.TimeoutError:
-        pass
     except asyncio.CancelledError:
         proc.kill()
         await proc.wait()
         return False
 
-    await proc.wait()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=FFMPEG_WAIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("FFmpeg wait timed out, killing process")
+        proc.kill()
+        await proc.wait()
+        return False
 
     if proc.returncode != 0:
         stderr_out = await proc.stderr.read()
@@ -159,6 +202,9 @@ async def compress_video(
         return False
 
     if progress_callback:
-        await progress_callback(100.0, duration)
+        try:
+            await progress_callback(100.0, duration)
+        except Exception:
+            pass
 
     return output_path.exists() and output_path.stat().st_size > 0

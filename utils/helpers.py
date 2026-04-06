@@ -79,6 +79,12 @@ class Cooldown:
         self._last[uid] = now
         return None
 
+    def cleanup(self, max_age: int = 3600):
+        now = time.time()
+        expired = [uid for uid, ts in self._last.items() if now - ts > max_age]
+        for uid in expired:
+            del self._last[uid]
+
 
 class ThrottledEditor:
     def __init__(self, client, chat_id: int, msg_id: int, interval: float = 1.5):
@@ -88,8 +94,11 @@ class ThrottledEditor:
         self._interval = interval
         self._last_t = 0.0
         self._last_txt = ""
+        self._dead = False
 
     async def __call__(self, text: str, force: bool = False, reply_markup=None):
+        if self._dead:
+            return
         if text == self._last_txt:
             return
         now = time.time()
@@ -110,6 +119,9 @@ class ThrottledEditor:
                 _log.debug("FloodWait %ds, pausing edits", wait_time)
             elif "MESSAGE_NOT_MODIFIED" in err_str:
                 self._last_txt = text
+            elif "MESSAGE_ID_INVALID" in err_str or "message to edit not found" in err_str.lower():
+                _log.warning("Message was deleted, editor disabled")
+                self._dead = True
             else:
                 self._last_t = time.time()
                 _log.warning("Edit failed: %s", err_str)
