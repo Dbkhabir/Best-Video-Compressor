@@ -36,8 +36,8 @@ TEMP_DIR = Path("/tmp/vcompressor")
 WORKDIR = Path(__file__).parent
 LOG_FILE = WORKDIR / "bot.log"
 
-EDIT_INTERVAL = 2.0
-PROGRESS_EDIT_INTERVAL = 1.5
+EDIT_INTERVAL = 3.0
+PROGRESS_EDIT_INTERVAL = 3.0
 
 QUALITY_PRESETS = {
     "low": {"crf": "32", "preset": "ultrafast", "label": "🟢 Low (Fast)"},
