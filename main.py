@@ -32,6 +32,31 @@ log = logging.getLogger("vbot")
 
 TEMP_CLEANUP_INTERVAL = 3600
 TEMP_MAX_AGE = 3600
+MAX_LOG_SIZE = 10 * 1024 * 1024
+
+
+def _rotate_log():
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
+            backup = LOG_FILE.with_suffix(".log.old")
+            if backup.exists():
+                backup.unlink()
+            LOG_FILE.rename(backup)
+            log.info("Log file rotated (was >%d MB)", MAX_LOG_SIZE // (1024 * 1024))
+    except Exception as e:
+        log.warning("Log rotation failed: %s", e)
+
+
+def _clean_session_files():
+    session_file = WORKDIR / "video_compressor_bot.session"
+    journal = WORKDIR / "video_compressor_bot.session-journal"
+    for f in [journal]:
+        if f.exists():
+            try:
+                f.unlink()
+                log.info("Cleaned stale session journal: %s", f.name)
+            except Exception as e:
+                log.warning("Could not clean %s: %s", f.name, e)
 
 
 async def temp_cleanup_worker():
@@ -43,17 +68,20 @@ async def temp_cleanup_worker():
                 continue
             now = time.time()
             cleaned = 0
+            total_freed = 0
             for item in TEMP_DIR.iterdir():
                 if item.is_dir():
                     try:
                         age = now - item.stat().st_mtime
                         if age > TEMP_MAX_AGE:
+                            dir_size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
                             shutil.rmtree(item, ignore_errors=True)
                             cleaned += 1
+                            total_freed += dir_size
                     except Exception:
                         pass
             if cleaned > 0:
-                log.info("Temp cleanup: removed %d old folders", cleaned)
+                log.info("Temp cleanup: removed %d old folders, freed %s", cleaned, human_size(total_freed))
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -61,6 +89,9 @@ async def temp_cleanup_worker():
 
 
 async def main():
+    _rotate_log()
+    _clean_session_files()
+
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -82,7 +113,7 @@ async def main():
 
     from handlers.user_handlers import register_user_handlers
     from handlers.admin_handlers import register_admin_handlers, register_admin_callbacks, register_admin_input_handler
-    from handlers.video_handler import register_video_handlers, queue_worker
+    from handlers.video_handler import register_video_handlers, queue_worker, NUM_WORKERS
 
     register_user_handlers(app)
     register_admin_handlers(app)
@@ -91,11 +122,23 @@ async def main():
     register_video_handlers(app)
 
     log.info("Starting Pyrogram client...")
-    await app.start()
+    try:
+        await app.start()
+    except Exception as e:
+        err_str = str(e).lower()
+        if "database" in err_str or "locked" in err_str or "corrupt" in err_str:
+            log.warning("Session file may be corrupted, removing and retrying...")
+            session_file = WORKDIR / "video_compressor_bot.session"
+            if session_file.exists():
+                session_file.unlink()
+            await app.start()
+        else:
+            raise
+
     me = await app.get_me()
     log.info("Bot ready: @%s (id=%d)", me.username, me.id)
 
-    worker_task = asyncio.create_task(queue_worker(app))
+    worker_tasks = [asyncio.create_task(queue_worker(app, i + 1)) for i in range(NUM_WORKERS)]
     cleanup_task = asyncio.create_task(temp_cleanup_worker())
 
     stats = await db.global_stats()
@@ -104,6 +147,7 @@ async def main():
         f"  🎬  {BOT_NAME} v1.0\n"
         f"  Bot      : @{me.username}\n"
         f"  Mode     : Pyrogram MTProto\n"
+        f"  Workers  : {NUM_WORKERS}\n"
         f"  Users    : {stats['users']:,}\n"
         f"  Compressed: {stats['compressions']:,}\n"
         f"  Saved    : {human_size(stats['total_saved'])}\n"
@@ -124,12 +168,14 @@ async def main():
         await stop_event.wait()
     finally:
         log.info("Shutting down...")
-        worker_task.cancel()
+        for wt in worker_tasks:
+            wt.cancel()
         cleanup_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+        for wt in worker_tasks:
+            try:
+                await wt
+            except asyncio.CancelledError:
+                pass
         try:
             await cleanup_task
         except asyncio.CancelledError:
