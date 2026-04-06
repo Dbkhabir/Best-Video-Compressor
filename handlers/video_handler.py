@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import shutil
 import time
 import uuid
@@ -35,6 +36,22 @@ task_queue: asyncio.Queue = asyncio.Queue()
 
 H = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
+PENDING_EXPIRE = 10 * 60
+NUM_WORKERS = 2
+STALL_TIMEOUT = 5 * 60
+WATCHDOG_CHECK = 30
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    name = name.strip('. ')
+    if not name:
+        name = "video"
+    if len(name) > 200:
+        ext = name.rsplit('.', 1)[-1] if '.' in name else ''
+        name = name[:190] + ('.' + ext if ext else '')
+    return name
+
 
 def _is_video(message: Message) -> bool:
     if message.video:
@@ -67,6 +84,14 @@ def _get_file_info(message: Message) -> Optional[tuple]:
 
 def _queue_position() -> int:
     return task_queue.qsize() + len(active_tasks)
+
+
+def _cleanup_stale_pending():
+    now = time.time()
+    expired = [uid for uid, t in pending_tasks.items() if now - t.get("created_at", now) > PENDING_EXPIRE]
+    for uid in expired:
+        pending_tasks.pop(uid, None)
+        log.info("Cleaned up stale pending task for uid=%s", uid)
 
 
 async def _get_force_channel() -> Optional[str]:
@@ -106,8 +131,20 @@ async def check_force_sub(client: Client, uid: int) -> bool:
     return False
 
 
-async def queue_worker(client: Client):
-    log.info("Queue worker started")
+async def _stall_watchdog(cancel_ev: asyncio.Event, last_progress: dict, uid: int, label: str):
+    while not cancel_ev.is_set():
+        await asyncio.sleep(WATCHDOG_CHECK)
+        if cancel_ev.is_set():
+            return
+        stall_time = time.time() - last_progress["time"]
+        if stall_time > STALL_TIMEOUT:
+            log.warning("%s stalled for uid=%s (no progress for %.0fs)", label, uid, stall_time)
+            cancel_ev.set()
+            return
+
+
+async def queue_worker(client: Client, worker_id: int = 1):
+    log.info("Queue worker #%d started", worker_id)
     while True:
         try:
             task = await task_queue.get()
@@ -118,12 +155,16 @@ async def queue_worker(client: Client):
             try:
                 await process_compression(client, task)
             except Exception as e:
-                log.exception("Task error for uid=%s: %s", uid, e)
+                log.exception("Worker #%d task error for uid=%s: %s", worker_id, uid, e)
             finally:
                 active_tasks.pop(uid, None)
+                cancel_events.pop(uid, None)
                 task_queue.task_done()
         except asyncio.CancelledError:
             break
+        except Exception as e:
+            log.exception("Worker #%d unexpected error: %s", worker_id, e)
+            await asyncio.sleep(1)
 
 
 async def process_compression(client: Client, task: dict):
@@ -137,10 +178,13 @@ async def process_compression(client: Client, task: dict):
     msg_id = task["status_msg_id"]
     task_start = time.time()
 
+    safe_file_name = _safe_filename(file_name)
+
     quality = QUALITY_PRESETS[quality_key]
     resolution = RESOLUTION_OPTIONS[resolution_key]
 
     cancel_ev = asyncio.Event()
+    last_progress = {"time": time.time(), "bytes": 0}
     cancel_events[uid] = cancel_ev
 
     cancel_kb = IKM([[IKB("🛑 Cancel", callback_data=f"cancel_{uid}")]])
@@ -149,10 +193,12 @@ async def process_compression(client: Client, task: dict):
 
     dest_dir = TEMP_DIR / str(uuid.uuid4())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    input_file = dest_dir / file_name
-    safe_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
-    output_file = dest_dir / f"{safe_name}_compressed.mp4"
+    input_file = dest_dir / safe_file_name
+    safe_stem = safe_file_name.rsplit(".", 1)[0] if "." in safe_file_name else safe_file_name
+    output_file = dest_dir / f"{safe_stem}_compressed.mp4"
     thumb_file = dest_dir / "thumb.jpg"
+
+    watchdog_task = None
 
     try:
         await editor(
@@ -169,6 +215,9 @@ async def process_compression(client: Client, task: dict):
         async def dl_progress(current: int, total: int):
             if cancel_ev.is_set():
                 raise asyncio.CancelledError()
+            if current > last_progress["bytes"]:
+                last_progress["bytes"] = current
+                last_progress["time"] = time.time()
             try:
                 real_total = total if total > 0 else file_size
                 pct = current / real_total * 100 if real_total > 0 else 0
@@ -192,11 +241,22 @@ async def process_compression(client: Client, task: dict):
             except Exception as e:
                 log.debug("dl_progress error: %s", e)
 
+        last_progress["time"] = time.time()
+        last_progress["bytes"] = 0
+        watchdog_task = asyncio.create_task(_stall_watchdog(cancel_ev, last_progress, uid, "Download"))
+
         await client.download_media(
             file_id,
             file_name=str(input_file),
             progress=dl_progress,
         )
+
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        watchdog_task = None
 
         if cancel_ev.is_set():
             raise asyncio.CancelledError()
@@ -235,6 +295,7 @@ async def process_compression(client: Client, task: dict):
         compress_start = time.time()
 
         async def compress_progress(pct: float, duration: float):
+            last_progress["time"] = time.time()
             elapsed = time.time() - compress_start
             eta_val = (elapsed / pct * (100 - pct)) if pct > 0 else None
             bar = progress_bar(pct)
@@ -249,6 +310,9 @@ async def process_compression(client: Client, task: dict):
                 reply_markup=cancel_kb,
             )
 
+        last_progress["time"] = time.time()
+        watchdog_task = asyncio.create_task(_stall_watchdog(cancel_ev, last_progress, uid, "Compress"))
+
         success = await compress_video(
             input_path=input_file,
             output_path=output_file,
@@ -258,6 +322,13 @@ async def process_compression(client: Client, task: dict):
             cancel_event=cancel_ev,
             progress_callback=compress_progress,
         )
+
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        watchdog_task = None
 
         if cancel_ev.is_set():
             raise asyncio.CancelledError()
@@ -305,6 +376,9 @@ async def process_compression(client: Client, task: dict):
         async def up_progress(current: int, total: int):
             if cancel_ev.is_set():
                 raise asyncio.CancelledError()
+            if current > last_progress["bytes"]:
+                last_progress["bytes"] = current
+                last_progress["time"] = time.time()
             try:
                 pct = current / total * 100 if total else 0
                 elapsed = time.time() - start_up
@@ -351,6 +425,10 @@ async def process_compression(client: Client, task: dict):
             f"{BOT_FOOTER}"
         )
 
+        last_progress["time"] = time.time()
+        last_progress["bytes"] = 0
+        watchdog_task = asyncio.create_task(_stall_watchdog(cancel_ev, last_progress, uid, "Upload"))
+
         await client.send_video(
             chat_id=chat_id,
             video=str(output_file),
@@ -363,6 +441,13 @@ async def process_compression(client: Client, task: dict):
             reply_to_message_id=task.get("original_msg_id"),
             supports_streaming=True,
         )
+
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        watchdog_task = None
 
         elapsed_total = time.time() - task_start
 
@@ -386,9 +471,11 @@ async def process_compression(client: Client, task: dict):
             if log_ch:
                 log_chat_id = int(log_ch) if log_ch.lstrip("-").isdigit() else log_ch
                 user_name = task.get("user_name") or ""
-                mention = f"<a href='tg://user?id={uid}'>{user_name or uid}</a>"
+                display_name = user_name if user_name else str(uid)
+                mention = f"<a href='tg://user?id={uid}'>{display_name}</a>"
                 log_caption = (
-                    f"👤 <b>User:</b> {mention} [<code>{uid}</code>]\n"
+                    f"👤 <b>User:</b> {mention}\n"
+                    f"🆔 <b>ID:</b> <code>{uid}</code>\n"
                     f"🎞 <b>File:</b> {file_name[:50]}\n"
                     f"📦 <b>Size:</b> {human_size(actual_size)}\n"
                     f"🎛 <b>Quality:</b> {quality['label']} • {resolution_key}\n"
@@ -405,8 +492,31 @@ async def process_compression(client: Client, task: dict):
             log.warning("Failed to send log to channel: %s", e)
 
     except asyncio.CancelledError:
-        await editor("🛑 <b>Task cancelled by user.</b>", force=True)
-        log.info("Task cancelled by user %s", uid)
+        stalled = time.time() - last_progress["time"] > STALL_TIMEOUT
+        if stalled:
+            await editor(
+                f"⏰ <b>Task Stalled</b>\n"
+                f"{H}\n\n"
+                f"No progress for {STALL_TIMEOUT // 60} minutes.\n"
+                f"Task auto-cancelled. Please try again.\n\n"
+                f"{H}\n"
+                f"{BOT_FOOTER}",
+                force=True,
+            )
+            log.info("Task auto-cancelled (stall) for uid=%s", uid)
+        else:
+            elapsed = time.time() - task_start
+            await editor(
+                f"🛑 <b>Task Cancelled</b>\n"
+                f"{H}\n\n"
+                f"You cancelled this compression.\n"
+                f"⏱ <b>Time Spent:</b> <code>{human_duration(elapsed)}</code>\n\n"
+                f"📤 Send another video whenever you're ready!\n\n"
+                f"{H}\n"
+                f"{BOT_FOOTER}",
+                force=True,
+            )
+            log.info("Task cancelled by user %s", uid)
     except Exception as e:
         log.exception("Compression task error for uid=%s", uid)
         await editor(
@@ -419,6 +529,12 @@ async def process_compression(client: Client, task: dict):
             force=True,
         )
     finally:
+        if watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
         cancel_events.pop(uid, None)
         shutil.rmtree(dest_dir, ignore_errors=True)
 
@@ -544,6 +660,8 @@ def register_video_handlers(app: Client):
                 )
                 return
 
+        _cleanup_stale_pending()
+
         from config import ADMIN_IDS
         is_admin = uid in ADMIN_IDS
         if not is_admin:
@@ -591,6 +709,7 @@ def register_video_handlers(app: Client):
             "vid_width": fwidth,
             "vid_height": fheight,
             "user_name": user.first_name or user.username or "",
+            "created_at": time.time(),
         }
 
         dur_text = ""
