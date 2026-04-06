@@ -22,7 +22,7 @@ from config import (
 from database import db
 from utils.helpers import (
     Cooldown, ThrottledEditor, human_duration, human_size,
-    human_speed, human_eta, progress_bar,
+    human_speed, human_eta, progress_bar, safe_edit,
 )
 from utils.compressor import compress_video, extract_thumbnail, get_video_info
 
@@ -546,7 +546,7 @@ async def handle_quality_selection(client: Client, callback: CallbackQuery):
         return
 
     if uid not in pending_tasks:
-        await callback.message.edit_text("❌ Session expired. Please send the video again.")
+        await safe_edit(callback.message, "❌ Session expired. Please send the video again.")
         return
 
     pending_tasks[uid]["quality"] = quality_key
@@ -561,7 +561,8 @@ async def handle_quality_selection(client: Client, callback: CallbackQuery):
     if t.get("vid_width") and t.get("vid_height"):
         res_info = f"\n🎥 <b>Current:</b> {t['vid_width']}x{t['vid_height']}"
 
-    await callback.message.edit_text(
+    await safe_edit(
+        callback.message,
         f"📐 <b>Select Resolution</b>\n"
         f"{H}\n\n"
         f"🎞 <b>File:</b> <code>{t['file_name'][:40]}</code>\n"
@@ -579,7 +580,7 @@ async def handle_resolution_selection(client: Client, callback: CallbackQuery):
         return
 
     if uid not in pending_tasks:
-        await callback.message.edit_text("❌ Session expired. Please send the video again.")
+        await safe_edit(callback.message, "❌ Session expired. Please send the video again.")
         return
 
     task_data = pending_tasks[uid]
@@ -589,7 +590,8 @@ async def handle_resolution_selection(client: Client, callback: CallbackQuery):
     pos = _queue_position() + 1
 
     cancel_kb = IKM([[IKB("🛑 Cancel", callback_data=f"cancel_{uid}")]])
-    await callback.message.edit_text(
+    await safe_edit(
+        callback.message,
         f"⏳ <b>Task Queued</b>  •  Position: <b>#{pos}</b>\n"
         f"{H}\n\n"
         f"🎞 <b>File:</b> <code>{task_data['file_name'][:40]}</code>\n"

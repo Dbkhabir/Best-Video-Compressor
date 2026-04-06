@@ -14,7 +14,7 @@ from config import (
     COOLDOWN_SECONDS, FORCE_SUB_CHANNEL,
 )
 from database import db
-from utils.helpers import human_size, human_duration, short_name, Cooldown
+from utils.helpers import human_size, human_duration, short_name, Cooldown, safe_edit
 
 log = logging.getLogger("vbot.user")
 cooldown = Cooldown(COOLDOWN_SECONDS)
@@ -179,7 +179,8 @@ def register_user_handlers(app: Client):
                 [IKB("📚 Help", callback_data="help"), IKB("🖥 Bot Info", callback_data="info")],
                 [IKB("👤 My Profile", callback_data="profile"), IKB("🗂 History", callback_data="history")],
             ])
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"🎬 <b>{BOT_NAME}</b>\n"
                 f"{H}\n\n"
                 f"Hey, <b>{short_name(user)}</b>! 👋\n\n"
@@ -193,7 +194,8 @@ def register_user_handlers(app: Client):
         elif data == "help":
             await callback.answer()
             kb = IKM([[IKB("🏠 Back to Menu", callback_data="start")]])
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"📚 <b>Help & Guide</b>\n"
                 f"{H}\n\n"
                 f"📖 <b>How It Works</b>\n"
@@ -211,7 +213,8 @@ def register_user_handlers(app: Client):
             stats = await db.global_stats()
             cpu = psutil.cpu_percent(interval=0.5)
             mem = psutil.virtual_memory()
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"🖥 <b>Bot Information</b>\n"
                 f"{H}\n\n"
                 f"🤖 <b>Version:</b> <code>{BOT_VERSION}</code>\n"
@@ -229,12 +232,13 @@ def register_user_handlers(app: Client):
             await callback.answer()
             user_data = await db.get_user(uid)
             if not user_data:
-                await callback.message.edit_text("❌ Profile not found. Send /start first.")
+                await safe_edit(callback.message, "❌ Profile not found. Send /start first.")
                 return
             daily = await db.get_daily_count(uid)
             daily_limit = int(await db.get_setting("daily_limit", "0"))
             limit_text = f"{daily}/{daily_limit}" if daily_limit > 0 else f"{daily}/∞"
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"👤 <b>Your Profile</b>\n"
                 f"{H}\n\n"
                 f"🆔 <b>User ID:</b> <code>{user_data['user_id']}</code>\n"
@@ -252,7 +256,8 @@ def register_user_handlers(app: Client):
             await callback.answer()
             h = await db.get_history(uid)
             if not h:
-                await callback.message.edit_text(
+                await safe_edit(
+                    callback.message,
                     "📭 No history yet. Send a video to start!",
                     reply_markup=IKM([[IKB("🏠 Menu", callback_data="start")]]),
                 )
@@ -272,7 +277,8 @@ def register_user_handlers(app: Client):
                     f"  📦 {human_size(orig)} → {human_size(comp)} (<b>{saved_pct:.0f}%</b> saved)"
                 )
             lines.append(f"\n\n{H}\n{BOT_FOOTER}")
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 "\n".join(lines),
                 reply_markup=IKM([[IKB("🏠 Menu", callback_data="start")]]),
             )

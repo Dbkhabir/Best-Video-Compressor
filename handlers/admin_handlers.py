@@ -11,7 +11,7 @@ from pyrogram.types import InlineKeyboardMarkup as IKM, InlineKeyboardButton as 
 
 from config import ADMIN_IDS, BOT_FOOTER, BOT_VERSION, LOG_FILE, TEMP_DIR
 from database import db
-from utils.helpers import human_size, human_duration
+from utils.helpers import human_size, human_duration, safe_edit
 
 log = logging.getLogger("vbot.admin")
 _bot_start_time = time.time()
@@ -213,7 +213,7 @@ def register_admin_callbacks(app: Client):
             await callback.answer()
             admin_input_state.pop(uid, None)
             text = await _settings_text()
-            await callback.message.edit_text(text, reply_markup=_settings_keyboard())
+            await safe_edit(callback.message, text, reply_markup=_settings_keyboard())
             return
 
         back_kb = IKM([[IKB("🔙 Back to Panel", callback_data="adm_back")]])
@@ -223,7 +223,8 @@ def register_admin_callbacks(app: Client):
             cur = await db.get_setting("daily_limit", "0")
             cur_d = f"{cur}/day" if cur != "0" else "Unlimited"
             admin_input_state[uid] = "daily_limit"
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"📊 <b>Daily Limit</b>\n{H}\n\n"
                 f"<b>Current:</b> <code>{cur_d}</code>\n\n"
                 f"Send a number to set the daily limit.\n"
@@ -236,7 +237,8 @@ def register_admin_callbacks(app: Client):
             await callback.answer()
             cur = await db.get_setting("cooldown", "5")
             admin_input_state[uid] = "cooldown"
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"⏱ <b>Cooldown</b>\n{H}\n\n"
                 f"<b>Current:</b> <code>{cur}s</code>\n\n"
                 f"Send seconds between tasks.\n"
@@ -250,7 +252,8 @@ def register_admin_callbacks(app: Client):
             cur = await db.get_setting("force_channel", "")
             cur_d = f"@{cur.lstrip('@')}" if cur else "Not set"
             admin_input_state[uid] = "force_channel"
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"📢 <b>Force Subscribe Channel</b>\n{H}\n\n"
                 f"<b>Current:</b> <code>{cur_d}</code>\n\n"
                 f"Send channel username or ID.\n"
@@ -264,7 +267,8 @@ def register_admin_callbacks(app: Client):
             cur = await db.get_setting("log_channel", "")
             cur_d = cur if cur else "Not set"
             admin_input_state[uid] = "log_channel"
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"📋 <b>Log Channel</b>\n{H}\n\n"
                 f"<b>Current:</b> <code>{cur_d}</code>\n\n"
                 f"Send channel ID (e.g. <code>-1001234567890</code>)\n"
@@ -278,7 +282,8 @@ def register_admin_callbacks(app: Client):
             await callback.answer()
             cur = await db.get_setting("max_size_mb", "2048")
             admin_input_state[uid] = "max_size_mb"
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"📏 <b>Max File Size</b>\n{H}\n\n"
                 f"<b>Current:</b> <code>{cur} MB</code>\n\n"
                 f"Send max file size in MB.\n\n"
@@ -297,7 +302,8 @@ def register_admin_callbacks(app: Client):
                             count += 1
                         except Exception:
                             pass
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"🧹 <b>Temp Cleanup Done</b>\n{H}\n\n"
                 f"  ● Deleted <b>{count}</b> temp folders.\n\n{H}\n{BOT_FOOTER}",
                 reply_markup=IKM([[IKB("🔙 Back to Panel", callback_data="adm_back")]]),
@@ -311,7 +317,8 @@ def register_admin_callbacks(app: Client):
             disk = psutil.disk_usage("/")
             stats = await db.global_stats()
             today = await db.today_stats()
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"🛠 <b>Admin Dashboard</b>\n{H}\n\n"
                 f"📊 <b>All-Time</b>\n"
                 f"  ● 👥 <b>Users:</b> <code>{stats['users']:,}</code>\n"
@@ -332,7 +339,8 @@ def register_admin_callbacks(app: Client):
             await callback.answer()
             users = await db.top_users(10)
             if not users:
-                await callback.message.edit_text(
+                await safe_edit(
+                    callback.message,
                     "📭 No users yet.",
                     reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
                 )
@@ -347,7 +355,8 @@ def register_admin_callbacks(app: Client):
                     f"  🎬 {u.get('total_compressed', 0):,} • 💾 {human_size(u.get('total_saved_size', 0))}"
                 )
             lines.append(f"\n\n{H}\n{BOT_FOOTER}")
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 "\n".join(lines),
                 reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
             )
@@ -355,7 +364,8 @@ def register_admin_callbacks(app: Client):
         elif data == "adm_today":
             await callback.answer()
             today = await db.today_stats()
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"📅 <b>Today's Stats</b>\n{H}\n\n"
                 f"  ● 🎬 <b>Compressions:</b> <code>{today['count']:,}</code>\n"
                 f"  ● 💾 <b>Space Saved:</b> <code>{human_size(today['saved'])}</code>\n\n"
@@ -366,7 +376,8 @@ def register_admin_callbacks(app: Client):
         elif data == "adm_users":
             await callback.answer()
             total = await db.total_users()
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 f"👥 <b>Total Users:</b> <code>{total:,}</code>",
                 reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
             )
@@ -375,7 +386,8 @@ def register_admin_callbacks(app: Client):
             await callback.answer()
             blist = await db.banned_list()
             if not blist:
-                await callback.message.edit_text(
+                await safe_edit(
+                    callback.message,
                     "✅ No banned users.",
                     reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
                 )
@@ -384,7 +396,8 @@ def register_admin_callbacks(app: Client):
             for u in blist[:20]:
                 lines.append(f"  ● <code>{u['user_id']}</code> — {u.get('first_name') or u.get('username') or '?'}")
             lines.append(f"\n\n{H}\n{BOT_FOOTER}")
-            await callback.message.edit_text(
+            await safe_edit(
+                callback.message,
                 "\n".join(lines),
                 reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
             )
@@ -392,7 +405,8 @@ def register_admin_callbacks(app: Client):
         elif data == "adm_logs":
             await callback.answer()
             if not LOG_FILE.exists():
-                await callback.message.edit_text(
+                await safe_edit(
+                    callback.message,
                     "📄 No log file found.",
                     reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
                 )
@@ -400,12 +414,14 @@ def register_admin_callbacks(app: Client):
             try:
                 content = LOG_FILE.read_text("utf-8")
                 last_lines = "\n".join(content.splitlines()[-25:])
-                await callback.message.edit_text(
+                await safe_edit(
+                    callback.message,
                     f"📄 <b>Recent Logs</b>\n\n<pre>{last_lines[:3500]}</pre>",
                     reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
                 )
             except Exception as e:
-                await callback.message.edit_text(
+                await safe_edit(
+                    callback.message,
                     f"❌ Error: {e}",
                     reply_markup=IKM([[IKB("🔙 Back", callback_data="adm_back")]]),
                 )
